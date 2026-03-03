@@ -1,0 +1,8 @@
+streamlit
+pandas
+duckdb
+python-dotenv
+sentence-transformers
+faiss-cpu
+openpyxl
+requests

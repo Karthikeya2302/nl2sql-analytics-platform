@@ -106,7 +106,7 @@ streamlit run app.py
 
 ## How it works
 
-
+###Single table
 Upload a CSV → ask a question → get results. That simple.
 
 ### Multiple tables

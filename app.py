@@ -8,6 +8,13 @@ import streamlit as st
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
+from db_connector import (
+    connect_to_postgres,
+    extract_db_schemas,
+    extract_fk_relationships,
+    get_db_name,
+    run_pg_query,
+)
 from llm import GroqLLM
 from matching import infer_relationships
 from prompt import build_prompt
@@ -49,36 +56,78 @@ st.caption("Upload CSV/Excel files, ask a question in plain English, and get res
 
 with st.sidebar:
     st.header("Settings")
+    data_source = st.radio("Data source", ["Upload files", "Connect to database"])
     groq_model = st.text_input("Groq model", value=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
     embed_model = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
     min_score = st.slider("Relationship min score", min_value=0.50, max_value=0.95, value=0.72, step=0.01)
     max_per_column = st.slider("Max relationships per column", min_value=0, max_value=5, value=2, step=1)
     show_prompt = st.checkbox("Show prompt (debug)", value=False)
 
-uploads = st.file_uploader(
-    "Upload one or more files",
-    type=["csv", "xlsx", "xls"],
-    accept_multiple_files=True,
-)
+    if data_source == "Connect to database":
+        st.markdown("---")
+        pg_uri = st.text_input(
+            "PostgreSQL URI",
+            type="password",
+            placeholder="postgresql://user:pass@host:5432/dbname",
+        )
+        if st.button("Connect"):
+            if not pg_uri.strip():
+                st.error("Please enter a PostgreSQL URI.")
+            else:
+                try:
+                    with st.spinner("Connecting..."):
+                        engine = connect_to_postgres(pg_uri)
+                        db_schemas = extract_db_schemas(engine)
+                        db_fk_rels = extract_fk_relationships(engine)
+                    st.session_state.db_engine = engine
+                    st.session_state.db_schemas = db_schemas
+                    st.session_state.db_fk_rels = db_fk_rels
+                    st.session_state.db_name = get_db_name(pg_uri)
+                except Exception as e:
+                    st.error(f"Connection failed: {e}")
+                    for key in ("db_engine", "db_schemas", "db_fk_rels", "db_name"):
+                        st.session_state.pop(key, None)
 
-if not uploads:
-    st.info("Upload CSV/Excel files to begin.")
-    st.stop()
+        if st.session_state.get("db_engine") is not None:
+            st.success(f"Connected to {st.session_state.db_name}")
 
-try:
-    tables = ingest_uploads(uploads)
-except Exception as e:
-    st.error(f"Failed to read uploaded files: {e}")
-    st.stop()
+# ── Data loading ──────────────────────────────────────────────────────────────
+if data_source == "Upload files":
+    uploads = st.file_uploader(
+        "Upload one or more files",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+    if not uploads:
+        st.info("Upload CSV/Excel files to begin.")
+        st.stop()
+    try:
+        tables = ingest_uploads(uploads)
+    except Exception as e:
+        st.error(f"Failed to read uploaded files: {e}")
+        st.stop()
+    schemas = extract_schemas(tables)
+    db_engine = None
+else:
+    if st.session_state.get("db_engine") is None:
+        st.info("Connect to a PostgreSQL database in the sidebar to begin.")
+        st.stop()
+    tables: Dict[str, pd.DataFrame] = {}
+    schemas = st.session_state.db_schemas
+    db_engine = st.session_state.db_engine
 
-schemas = extract_schemas(tables)
-
+# ── Display tables + schema ───────────────────────────────────────────────────
 left, right = st.columns([1, 1])
 with left:
     st.subheader("Tables")
-    for tname, df in tables.items():
-        with st.expander(f"{tname} — {len(df)} rows, {len(df.columns)} cols", expanded=False):
-            st.dataframe(df.head(50), use_container_width=True)
+    if tables:
+        for tname, df in tables.items():
+            with st.expander(f"{tname} — {len(df)} rows, {len(df.columns)} cols", expanded=False):
+                st.dataframe(df.head(50), use_container_width=True)
+    else:
+        for tname, ts in schemas.items():
+            with st.expander(f"{tname} — {len(ts.columns)} columns", expanded=False):
+                st.write([c.name for c in ts.columns])
 
 with right:
     st.subheader("Detected schema")
@@ -95,9 +144,15 @@ with right:
             )
     st.dataframe(pd.DataFrame(schema_rows), use_container_width=True, height=420)
 
+# ── Relationship detection ────────────────────────────────────────────────────
 st.subheader("Join hints (auto-detected)")
 relationships = []
-if len(tables) >= 2 and max_per_column > 0:
+
+using_fk = data_source == "Connect to database" and bool(st.session_state.get("db_fk_rels"))
+
+if using_fk:
+    relationships = st.session_state.db_fk_rels
+elif len(schemas) >= 2 and max_per_column > 0:
     try:
         embedder = get_embedder(embed_model)
         relationships = infer_relationships(
@@ -122,9 +177,12 @@ if relationships:
         ]
     )
     st.dataframe(rel_df, use_container_width=True, height=220)
+    if using_fk:
+        st.caption("Relationships sourced from PostgreSQL foreign key constraints.")
 else:
     st.caption("No relationships detected (or only one table uploaded).")
 
+# ── Question + run ────────────────────────────────────────────────────────────
 st.subheader("Ask a question")
 question = st.text_area(
     "Example: What are total sales by region this month?",
@@ -161,10 +219,14 @@ if run_btn:
             with st.expander("Prompt (debug)", expanded=False):
                 st.text(prompt)
 
-        with st.spinner("Executing in DuckDB..."):
-            conn = make_connection()
-            register_tables(conn, tables)
-            result_df = run_query(conn, sql)
+        if db_engine is not None:
+            with st.spinner("Executing in PostgreSQL..."):
+                result_df = run_pg_query(db_engine, sql)
+        else:
+            with st.spinner("Executing in DuckDB..."):
+                conn = make_connection()
+                register_tables(conn, tables)
+                result_df = run_query(conn, sql)
 
         st.subheader("Results")
         st.dataframe(result_df, use_container_width=True)

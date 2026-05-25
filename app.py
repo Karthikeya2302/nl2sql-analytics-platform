@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict
 
 import pandas as pd
@@ -59,8 +60,6 @@ with st.sidebar:
     data_source = st.radio("Data source", ["Upload files", "Connect to database"])
     groq_model = st.text_input("Groq model", value=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
     embed_model = st.text_input("Embedding model", value="all-MiniLM-L6-v2")
-    min_score = st.slider("Relationship min score", min_value=0.50, max_value=0.95, value=0.72, step=0.01)
-    max_per_column = st.slider("Max relationships per column", min_value=0, max_value=5, value=2, step=1)
     show_prompt = st.checkbox("Show prompt (debug)", value=False)
 
     if data_source == "Connect to database":
@@ -152,14 +151,24 @@ using_fk = data_source == "Connect to database" and bool(st.session_state.get("d
 
 if using_fk:
     relationships = st.session_state.db_fk_rels
-elif len(schemas) >= 2 and max_per_column > 0:
+elif len(schemas) >= 2:
     try:
-        embedder = get_embedder(embed_model)
+        embedder = None
+        _load_err = None
+        with st.spinner("Loading embedding model..."):
+            for _attempt in range(3):
+                try:
+                    embedder = get_embedder(embed_model)
+                    break
+                except Exception as e:
+                    _load_err = e
+                    if _attempt < 2:
+                        time.sleep(2)
+        if embedder is None:
+            raise _load_err
         relationships = infer_relationships(
             schemas,
             embedder=embedder,
-            max_per_column=int(max_per_column),
-            min_score=float(min_score),
         )
     except Exception as e:
         st.warning(f"Relationship detection unavailable: {e}")

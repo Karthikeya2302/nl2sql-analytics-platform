@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -28,6 +29,22 @@ def _is_id_like(col: str) -> bool:
     return c == "id" or c.endswith("_id") or c.endswith("id")
 
 
+def _elbow_eps(sorted_kdist: np.ndarray) -> float:
+    """Find eps at the knee of the sorted k-distance curve via max perpendicular distance from diagonal."""
+    n = len(sorted_kdist)
+    if n < 3:
+        return float(sorted_kdist[-1])
+    x = np.arange(n, dtype=float)
+    y = sorted_kdist.astype(float)
+    x1, y1, x2, y2 = x[0], y[0], x[-1], y[-1]
+    dx, dy = x2 - x1, y2 - y1
+    denom = np.sqrt(dx * dx + dy * dy)
+    if denom < 1e-10:
+        return float(y[-1])
+    perp = np.abs(dy * (x - x1) - dx * (y - y1)) / denom
+    return float(y[int(np.argmax(perp))])
+
+
 def build_column_corpus(schema: Dict[str, TableSchema]) -> Tuple[List[str], List[Tuple[str, str]]]:
     """
     Returns:
@@ -49,21 +66,23 @@ def build_column_corpus(schema: Dict[str, TableSchema]) -> Tuple[List[str], List
 def infer_relationships(
     schema: Dict[str, TableSchema],
     embedder,
-    max_per_column: int = 2,
-    min_score: float = 0.72,
 ) -> List[Relationship]:
     """
-    Lightweight relationship inference:
-    - Uses embeddings + cosine similarity to propose join keys across tables.
-    - Adds a small heuristic boost for id-like columns and exact-ish name patterns.
+    Relationship inference:
+    - FAISS embeddings as base for neighbor search and scoring
+    - k-distance elbow (kneedle method) auto-tunes DBSCAN eps
+    - DBSCAN clusters semantically similar columns across tables
+    - Hard cap at top 20 results by score
     """
     try:
         import faiss  # type: ignore
     except Exception as e:
         raise RuntimeError("FAISS is required for relationship inference. Install `faiss-cpu`.") from e
 
+    from sklearn.cluster import DBSCAN
+
     texts, keys = build_column_corpus(schema)
-    if not texts:
+    if len(keys) < 2:
         return []
 
     emb = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False)
@@ -74,69 +93,76 @@ def infer_relationships(
     index = faiss.IndexFlatIP(dim)
     index.add(emb)
 
+    # Auto-tune eps via k-distance elbow using FAISS nearest-neighbor distances
+    k_nn = min(5, len(keys) - 1)
+    faiss_scores, _ = index.search(emb, k_nn + 1)  # +1 to skip self at position 0
+    k_elbow = min(4, k_nn)
+    # Cosine distance = 1 - cosine_similarity (embeddings are L2-normalized so IP = cosine sim)
+    kdist_col = (1.0 - faiss_scores[:, k_elbow]).clip(0.0, 2.0)
+    sorted_kdist = np.sort(kdist_col)
+    eps = max(_elbow_eps(sorted_kdist), 0.01)
+
+    # DBSCAN clustering on embedding space
+    labels = DBSCAN(eps=eps, min_samples=2, metric="cosine").fit_predict(emb)
+
+    # Generate candidate pairs from within-cluster, cross-table column pairs
+    clusters: dict[int, list[int]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        if label >= 0:  # -1 = noise
+            clusters[label].append(idx)
+
     rels: List[Relationship] = []
-    seen = set()
+    seen: set = set()
 
-    # Search for nearest neighbors for each column; filter to other tables.
-    k = min(len(keys), 12)
-    scores, idxs = index.search(emb, k)
+    for members in clusters.values():
+        for pi, i in enumerate(members):
+            t1, c1 = keys[i]
+            for j in members[pi + 1:]:
+                t2, c2 = keys[j]
+                if t1 == t2:
+                    continue
 
-    for i, (t1, c1) in enumerate(keys):
-        for jpos in range(1, k):
-            j = int(idxs[i, jpos])
-            if j < 0 or j >= len(keys):
-                continue
-            t2, c2 = keys[j]
-            if t1 == t2:
-                continue
+                s = float(np.dot(emb[i], emb[j]))  # cosine similarity (normalized vectors)
+                reason_parts = ["semantic similarity"]
 
-            s = float(scores[i, jpos])
-            reason_parts = ["semantic similarity"]
+                if _is_id_like(c1) and _is_id_like(c2) and c1.lower() == c2.lower():
+                    s = min(0.999, s + 0.05)
+                    reason_parts.append("id-like columns")
+                if c1.lower() == c2.lower():
+                    s = min(0.999, s + 0.07)
+                    reason_parts.append("same column name")
+                if c1.lower() == f"{t2.lower()}_id" or c2.lower() == f"{t1.lower()}_id":
+                    s = min(0.999, s + 0.07)
+                    reason_parts.append("foreign-key naming pattern")
 
-            # Heuristic boosts / reasons
-            if _is_id_like(c1) and _is_id_like(c2):
-                s = min(0.999, s + 0.05)
-                reason_parts.append("id-like columns")
-            if c1.lower() == c2.lower():
-                s = min(0.999, s + 0.07)
-                reason_parts.append("same column name")
-            if c1.lower() == f"{t2.lower()}_id" or c2.lower() == f"{t1.lower()}_id":
-                s = min(0.999, s + 0.07)
-                reason_parts.append("foreign-key naming pattern")
+                a = (t1, c1, t2, c2)
+                b = (t2, c2, t1, c1)
+                if a in seen or b in seen:
+                    continue
+                seen.add(a)
 
-            if s < min_score:
-                continue
-
-            # De-dup (unordered pair)
-            a = (t1, c1, t2, c2)
-            b = (t2, c2, t1, c1)
-            if a in seen or b in seen:
-                continue
-            seen.add(a)
-
-            rels.append(
-                Relationship(
-                    left_table=t1,
-                    left_column=c1,
-                    right_table=t2,
-                    right_column=c2,
-                    score=s,
-                    reason=", ".join(reason_parts),
+                rels.append(
+                    Relationship(
+                        left_table=t1,
+                        left_column=c1,
+                        right_table=t2,
+                        right_column=c2,
+                        score=s,
+                        reason=", ".join(reason_parts),
+                    )
                 )
-            )
 
-    # Sort by score; limit per column to keep prompt small.
     rels.sort(key=lambda r: r.score, reverse=True)
-
-    per_col = {}
-    out: List[Relationship] = []
-    for r in rels:
-        key = (r.left_table, r.left_column)
-        if per_col.get(key, 0) >= max_per_column:
-            continue
-        per_col[key] = per_col.get(key, 0) + 1
-        out.append(r)
-    return out
+    if len(rels) > 1:
+        scores_arr = np.sort([r.score for r in rels])  # ascending
+        diffs = np.diff(scores_arr)
+        elbow_idx = int(np.argmax(diffs))
+        threshold = float(scores_arr[elbow_idx + 1])   # first score above the biggest jump
+        rels = [
+            r for r in rels
+            if r.score >= threshold or r.left_column.lower() == r.right_column.lower()
+        ]
+    return rels[:20]
 
 
 def format_relationships_for_prompt(relationships: Sequence[Relationship]) -> str:
@@ -148,4 +174,3 @@ def format_relationships_for_prompt(relationships: Sequence[Relationship]) -> st
             f"- {r.left_table}.{r.left_column} ↔ {r.right_table}.{r.right_column} (score {r.score:.2f}; {r.reason})"
         )
     return "\n".join(lines)
-

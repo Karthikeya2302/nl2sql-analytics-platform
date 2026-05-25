@@ -224,6 +224,15 @@ if run_btn:
         st.subheader("Generated SQL")
         st.code(sql, language="sql")
 
+        try:
+            with st.spinner("Explaining query..."):
+                explanation = llm.explain_query(sql, schemas, question)
+            if explanation:
+                st.subheader("Why this SQL?")
+                st.info(explanation)
+        except Exception:
+            pass
+
         if show_prompt:
             with st.expander("Prompt (debug)", expanded=False):
                 st.text(prompt)
